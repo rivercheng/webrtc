@@ -1054,6 +1054,10 @@ func (pc *PeerConnection) drainSRTP() {
 				pc.log.Warnf("Could not add transceiver for remote SSRC %d: %s", ssrc, err)
 				return false
 			}
+			// hacking.
+			t.Receiver().Track().mu.Lock()
+			t.Receiver().Track().useRid = true
+			t.Receiver().Track().mu.Unlock()
 			pc.startReceiver(incoming, t.Receiver())
 			return true
 		}
@@ -1717,6 +1721,10 @@ func (pc *PeerConnection) startRTP(isRenegotiation bool, remoteDesc *SessionDesc
 				incoming := trackDetails[ssrc]
 				t.Receiver().Track().id = incoming.id
 				t.Receiver().Track().label = incoming.label
+				t.Receiver().Track().mu.Unlock()
+				continue
+			}
+			if t.Receiver().Track().useRid {
 				t.Receiver().Track().mu.Unlock()
 				continue
 			}
