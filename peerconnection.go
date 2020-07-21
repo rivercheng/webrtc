@@ -1054,11 +1054,11 @@ func (pc *PeerConnection) drainSRTP() {
 				pc.log.Warnf("Could not add transceiver for remote SSRC %d: %s", ssrc, err)
 				return false
 			}
+			pc.startReceiver(incoming, t.Receiver())
 			// hacking.
 			t.Receiver().Track().mu.Lock()
 			t.Receiver().Track().useRid = true
 			t.Receiver().Track().mu.Unlock()
-			pc.startReceiver(incoming, t.Receiver())
 			return true
 		}
 
