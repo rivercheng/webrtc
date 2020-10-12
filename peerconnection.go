@@ -50,6 +50,7 @@ type PeerConnection struct {
 	negotiationNeeded            bool
 	nonTrickleCandidatesSignaled *atomicBool
 
+	sessionID  uint64
 	lastOffer  string
 	lastAnswer string
 
@@ -471,6 +472,7 @@ func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription
 		SDP:    string(sdpBytes),
 		parsed: d,
 	}
+	pc.sessionID = d.Origin.SessionID
 	pc.lastOffer = desc.SDP
 	return desc, nil
 }
@@ -1823,6 +1825,9 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 	d := sdp.NewJSEPSessionDescription(useIdentity)
 	if err := addFingerprints(d, pc.configuration.Certificates[0]); err != nil {
 		return nil, err
+	}
+	if pc.sessionID != 0 {
+		d.Origin.SessionID = pc.sessionID
 	}
 
 	iceParams, err := pc.iceGatherer.GetLocalParameters()
