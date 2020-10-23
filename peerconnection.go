@@ -46,9 +46,8 @@ type PeerConnection struct {
 
 	idpLoginURL *string
 
-	isClosed                     *atomicBool
-	negotiationNeeded            bool
-	nonTrickleCandidatesSignaled *atomicBool
+	isClosed          *atomicBool
+	negotiationNeeded bool
 
 	sessionID  uint64
 	lastOffer  string
@@ -103,15 +102,14 @@ func (api *API) NewPeerConnection(configuration Configuration) (*PeerConnection,
 			Certificates:         []Certificate{},
 			ICECandidatePoolSize: 0,
 		},
-		isClosed:                     &atomicBool{},
-		negotiationNeeded:            false,
-		nonTrickleCandidatesSignaled: &atomicBool{},
-		lastOffer:                    "",
-		lastAnswer:                   "",
-		greaterMid:                   -1,
-		signalingState:               SignalingStateStable,
-		iceConnectionState:           ICEConnectionStateNew,
-		connectionState:              PeerConnectionStateNew,
+		isClosed:           &atomicBool{},
+		negotiationNeeded:  false,
+		lastOffer:          "",
+		lastAnswer:         "",
+		greaterMid:         -1,
+		signalingState:     SignalingStateStable,
+		iceConnectionState: ICEConnectionStateNew,
+		connectionState:    PeerConnectionStateNew,
 
 		api: api,
 		log: api.settingEngine.LoggerFactory.NewLogger("pc"),
@@ -125,12 +123,6 @@ func (api *API) NewPeerConnection(configuration Configuration) (*PeerConnection,
 	pc.iceGatherer, err = pc.createICEGatherer()
 	if err != nil {
 		return nil, err
-	}
-
-	if !pc.api.settingEngine.candidates.ICETrickle {
-		if err = pc.iceGatherer.Gather(); err != nil {
-			return nil, err
-		}
 	}
 
 	// Create the ice transport
@@ -405,12 +397,16 @@ func (pc *PeerConnection) getStatsID() string {
 func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription, error) {
 	useIdentity := pc.idpLoginURL != nil
 	switch {
-	case options != nil:
-		return SessionDescription{}, fmt.Errorf("TODO handle options")
 	case useIdentity:
 		return SessionDescription{}, fmt.Errorf("TODO handle identity provider")
 	case pc.isClosed.get():
 		return SessionDescription{}, &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
+	}
+
+	if options != nil && options.ICERestart {
+		if err := pc.iceTransport.restart(); err != nil {
+			return SessionDescription{}, err
+		}
 	}
 
 	isPlanB := pc.configuration.SDPSemantics == SDPSemanticsPlanB
@@ -567,8 +563,6 @@ func (pc *PeerConnection) createICETransport() *ICETransport {
 func (pc *PeerConnection) CreateAnswer(options *AnswerOptions) (SessionDescription, error) {
 	useIdentity := pc.idpLoginURL != nil
 	switch {
-	case options != nil:
-		return SessionDescription{}, fmt.Errorf("TODO handle options")
 	case pc.RemoteDescription() == nil:
 		return SessionDescription{}, &rtcerr.InvalidStateError{Err: ErrNoRemoteDescription}
 	case useIdentity:
@@ -745,18 +739,6 @@ func (pc *PeerConnection) SetLocalDescription(desc SessionDescription) error {
 		})
 	}
 
-	// To support all unittests which are following the future trickle=true
-	// setup while also support the old trickle=false synchronous gathering
-	// process this is necessary to avoid calling Gather() in multiple
-	// places; which causes race conditions. (issue-707)
-	if !pc.api.settingEngine.candidates.ICETrickle && !pc.nonTrickleCandidatesSignaled.get() {
-		if err := pc.iceGatherer.SignalCandidates(); err != nil {
-			return err
-		}
-		pc.nonTrickleCandidatesSignaled.set(true)
-		return nil
-	}
-
 	if pc.iceGatherer.State() == ICEGathererStateNew {
 		return pc.iceGatherer.Gather()
 	}
@@ -775,12 +757,13 @@ func (pc *PeerConnection) LocalDescription() *SessionDescription {
 }
 
 // SetRemoteDescription sets the SessionDescription of the remote peer
+// nolint: gocyclo
 func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 	if pc.isClosed.get() {
 		return &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
 	}
 
-	haveRemoteDescription := pc.currentRemoteDescription != nil
+	isRenegotation := pc.currentRemoteDescription != nil
 
 	desc.parsed = &sdp.SessionDescription{}
 	if err := desc.parsed.Unmarshal([]byte(desc.SDP)); err != nil {
@@ -790,11 +773,10 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 		return err
 	}
 
-	weOffer := desc.Type == SDPTypeAnswer
-
 	var t *RTPTransceiver
 	localTransceivers := append([]*RTPTransceiver{}, pc.GetTransceivers()...)
 	detectedPlanB := descriptionIsPlanB(pc.RemoteDescription())
+	weOffer := desc.Type == SDPTypeAnswer
 
 	if !weOffer && !detectedPlanB {
 		for _, media := range pc.RemoteDescription().parsed.MediaDescriptions {
@@ -830,7 +812,31 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 		}
 	}
 
-	if haveRemoteDescription {
+	remoteUfrag, remotePwd, candidates, err := extractICEDetails(desc.parsed)
+	if err != nil {
+		return err
+	}
+
+	if isRenegotation && pc.iceTransport.haveRemoteCredentialsChange(remoteUfrag, remotePwd) {
+		// An ICE Restart only happens implicitly for a SetRemoteDescription of type offer
+		if !weOffer {
+			if err = pc.iceTransport.restart(); err != nil {
+				return err
+			}
+		}
+
+		if err = pc.iceTransport.setRemoteCredentials(remoteUfrag, remotePwd); err != nil {
+			return err
+		}
+	}
+
+	for _, c := range candidates {
+		if err = pc.iceTransport.AddRemoteCandidate(c); err != nil {
+			return err
+		}
+	}
+
+	if isRenegotation {
 		if weOffer {
 			pc.ops.Enqueue(func() {
 				pc.startRTP(true, &desc)
@@ -847,17 +853,6 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 	fingerprint, fingerprintHash, err := extractFingerprint(desc.parsed)
 	if err != nil {
 		return err
-	}
-
-	remoteUfrag, remotePwd, candidates, err := extractICEDetails(desc.parsed)
-	if err != nil {
-		return err
-	}
-
-	for _, c := range candidates {
-		if err = pc.iceTransport.AddRemoteCandidate(c); err != nil {
-			return err
-		}
 	}
 
 	iceRole := ICERoleControlled
@@ -1920,4 +1915,8 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 	}
 
 	return populateSDP(d, detectedPlanB, pc.api.settingEngine.candidates.ICELite, pc.api.mediaEngine, connectionRole, candidates, iceParams, mediaSections, pc.ICEGatheringState())
+}
+
+func (pc *PeerConnection) setGatherCompleteHdlr(hdlr func()) {
+	pc.iceGatherer.onGatheringCompleteHdlr.Store(hdlr)
 }
